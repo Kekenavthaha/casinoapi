@@ -3,6 +3,7 @@ import hmac
 import json
 import random
 import os
+from datetime import datetime
 from urllib.parse import parse_qsl
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -54,6 +55,7 @@ def get_user(user_id):
     else:
         return {"score": 0, "username": ""}
 
+# ✅ Обновлённая функция: баланс меняется, но daily_earned НЕ трогается
 def update_user_balance(user_id: int, username: str, delta: int):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -61,8 +63,7 @@ def update_user_balance(user_id: int, username: str, delta: int):
     if not cursor.fetchone():
         cursor.execute("INSERT INTO users (user_id, username, score, daily_earned) VALUES (?, ?, 0, 0)", (user_id, username))
     cursor.execute("UPDATE users SET score = score + ? WHERE user_id = ?", (delta, user_id))
-    if delta > 0:
-        cursor.execute("UPDATE users SET daily_earned = daily_earned + ? WHERE user_id = ?", (delta, user_id))
+    # НЕ трогаем daily_earned — этим займётся daily_casino_result
     conn.commit()
     conn.close()
 
@@ -155,7 +156,7 @@ def init_casino():
         return error_response, status
     user_id = user_data["id"]
     username = user_data.get("username") or user_data.get("first_name", "Player")
-    update_user_balance(user_id, username, 0)
+    update_user_balance(user_id, username, 0)  # создаём, если нет
     data = get_user(user_id)
     return jsonify({"balance": data["score"], "user_id": user_id})
 
@@ -175,10 +176,15 @@ def place_bet():
     data = get_user(user_id)
     if data["score"] < bet:
         return jsonify({"detail": "Not enough credits"}), 400
+
+    # Списываем ставку (daily_earned не меняется)
     update_user_balance(user_id, username, -bet)
     jackpot_fee = int(bet * 0.02)
     if jackpot_fee > 0:
         update_jackpot(jackpot_fee)
+
+    # Игровая логика
+    win = 0
     result = {}
     if game == "slots":
         symbols = spin_slots()
@@ -207,7 +213,6 @@ def place_bet():
     elif game == "dice":
         guess_sum = extra_data.get("sum")
         d1, d2, total = roll_dice()
-        win = 0
         if total == guess_sum:
             win = bet * DICE_ODDS.get(total, 4)
             update_user_balance(user_id, username, win)
@@ -220,6 +225,20 @@ def place_bet():
         }
     else:
         return jsonify({"detail": "Unknown game"}), 400
+
+    # ✅ Записываем чистую прибыль за эту ставку в daily_casino_result
+    net_profit = win - bet
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO daily_casino_result (user_id, date, net_profit)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, date) DO UPDATE SET net_profit = net_profit + ?
+    """, (user_id, today, net_profit, net_profit))
+    conn.commit()
+    conn.close()
+
     return jsonify(result)
 
 @app.route("/health")
